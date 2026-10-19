@@ -530,7 +530,7 @@ impl ControlClient {
                     *status = st
                 }
                 (Step::Polling { stream, status, buf }, H2Event::Data { stream: sid, data }) if *stream == sid => {
-                    buf.extend(data);
+                    extend_map_buffer(buf, &data);
                     if *status != 200 {
                         continue;
                     }
@@ -606,6 +606,27 @@ impl ControlClient {
         self.phase = Phase::Idle { until: self.now + delay };
         self.updates.push_back(Update::Error(msg.into()));
     }
+}
+
+/// Appends received bytes to the map-poll buffer. Once the length prefix of
+/// the frame being received is known, the buffer is sized for the whole frame
+/// in one allocation instead of growing by doubling, which would need a
+/// 128 KiB block for a map just over 64 KiB.
+fn extend_map_buffer(buf: &mut Vec<u8>, data: &[u8]) {
+    let head = data.len().min(4usize.saturating_sub(buf.len()));
+    buf.extend_from_slice(&data[..head]);
+    let data = &data[head..];
+    let mut need = buf.len() + data.len();
+    if buf.len() >= 4 {
+        let len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
+        if len <= MAX_MAP_MESSAGE {
+            need = need.max(4 + len);
+        }
+    }
+    if need > buf.capacity() {
+        buf.reserve_exact(need - buf.len());
+    }
+    buf.extend_from_slice(data);
 }
 
 /// Takes the length-prefixed frame at the front of `buf` and returns its body
@@ -739,6 +760,43 @@ mod tests {
         let second = take_map_frame(&mut buf, 4);
         assert_eq!(second, b"next");
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn map_buffer_is_sized_for_the_frame_not_doubled() {
+        // A frame just over 64 KiB, delivered as HTTP/2 DATA payloads of at most 16 KiB.
+        let len = 65_600;
+        let mut frame = (len as u32).to_le_bytes().to_vec();
+        frame.resize(4 + len, b'x');
+        let mut buf = Vec::new();
+        for chunk in frame.chunks(16_384) {
+            extend_map_buffer(&mut buf, chunk);
+        }
+        assert_eq!(buf, frame);
+        assert_eq!(buf.capacity(), 4 + len, "buffer grew past the frame size");
+    }
+
+    #[test]
+    fn map_buffer_handles_split_length_prefix_and_following_frame() {
+        let mut stream = 5u32.to_le_bytes().to_vec();
+        stream.extend_from_slice(b"hello");
+        stream.extend_from_slice(&3u32.to_le_bytes());
+        stream.extend_from_slice(b"abc");
+        let mut buf = Vec::new();
+        for chunk in stream.chunks(3) {
+            extend_map_buffer(&mut buf, chunk);
+        }
+        assert_eq!(buf, stream);
+        assert_eq!(take_map_frame(&mut buf, 5), b"hello");
+        assert_eq!(take_map_frame(&mut buf, 3), b"abc");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn map_buffer_ignores_oversized_length_prefix() {
+        let mut buf = Vec::new();
+        extend_map_buffer(&mut buf, &u32::MAX.to_le_bytes());
+        assert!(buf.capacity() < 1024, "reserved for a length that will be rejected");
     }
 
     #[test]
